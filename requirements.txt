@@ -1,0 +1,10 @@
+faker
+pandas
+numpy
+scikit-learn
+streamlit
+pyvis
+matplotlib
+networkx
+geoip2
+requests
