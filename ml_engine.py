@@ -25,6 +25,16 @@ from sklearn.preprocessing import MinMaxScaler
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+import builtins as _builtins
+_print = _builtins.print  # capture real print before any overrides
+
+def _log(msg: str) -> None:
+    """Safe print wrapper — silently ignores I/O errors (e.g. inside Streamlit)."""
+    try:
+        _print(msg)
+    except OSError:
+        pass
+
 INPUT_CSV = "bitcoin_traffic.csv"
 OUTPUT_CSV = "flagged_transactions.csv"
 CONTAMINATION = 0.05
@@ -38,7 +48,7 @@ MICRO_TX_THRESHOLD = 0.006
 
 def load_data(filepath: str = INPUT_CSV) -> pd.DataFrame:
     df = pd.read_csv(filepath, parse_dates=["timestamp"])
-    print(f"[*] Loaded {len(df)} transactions from {filepath}")
+    _log(f"[*] Loaded {len(df)} transactions from {filepath}")
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -50,7 +60,7 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
     Builds the Entity-Transaction graph and clusters wallets using the 
     Common-Input-Ownership heuristic.
     """
-    print("[*] Building Entity/Transaction graph with NetworkX ...")
+    _log("[*] Building Entity/Transaction graph with NetworkX ...")
     
     # Bipartite mapping to cluster addresses
     address_graph = nx.Graph()
@@ -64,14 +74,14 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
                 address_graph.add_edge(inputs[i], inputs[j])
                     
     # Union Find (Connected Components) for entity clustering
-    print("[*] Running Union-Find wallet clustering (Common-Input-Ownership) ...")
+    _log("[*] Running Union-Find wallet clustering (Common-Input-Ownership) ...")
     entity_map = {}
     components = list(nx.connected_components(address_graph))
     for entity_id, comp in enumerate(components):
         for addr in comp:
             entity_map[addr] = f"Entity_{entity_id}"
             
-    print(f"[*] Clustered {len(address_graph.nodes)} addresses into {len(components)} entities.")
+    _log(f"[*] Clustered {len(address_graph.nodes)} addresses into {len(components)} entities.")
     return address_graph, entity_map
 
 def _frequency_encode(series: pd.Series) -> pd.Series:
@@ -115,15 +125,30 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     features["geo_freq"] = _frequency_encode(df["geo_country"])
     features["is_high_risk_geo"] = df["geo_country"].isin(HIGH_RISK_COUNTRIES).astype(int)
 
+    # Calculate total input amount for each transaction
+    def calc_total(amount_str):
+        try:
+            return sum(float(a) for a in str(amount_str).split("|") if a.strip())
+        except:
+            return 0.0
+    
+    df["total_amount_btc"] = df["input_amounts"].apply(calc_total)
+
     # --- Amount & Port Features ---
     scaler = MinMaxScaler()
-    features["amount_btc_scaled"] = scaler.fit_transform(df[["amount_btc"]])
-    features["is_micro_tx"] = (df["amount_btc"] < MICRO_TX_THRESHOLD).astype(int)
+    features["amount_btc_scaled"] = scaler.fit_transform(df[["total_amount_btc"]])
+    if "fee" in df.columns:
+        features["fee_scaled"] = scaler.fit_transform(df[["fee"]])
+    features["is_micro_tx"] = (df["total_amount_btc"] < MICRO_TX_THRESHOLD).astype(int)
+    
+    # Script type frequency encoding
+    if "script_type" in df.columns:
+        features["script_type_freq"] = _frequency_encode(df["script_type"])
     
     standard_ports = {8332, 8333, 8334, 18332, 18333}
     features["src_port_is_std"] = df["src_port"].isin(standard_ports).astype(int)
 
-    print(f"[*] Engineered {features.shape[1]} features: {list(features.columns)}")
+    _log(f"[*] Engineered {features.shape[1]} features: {list(features.columns)}")
     return features, df
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -131,20 +156,20 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def train_model(features: pd.DataFrame, contamination: float = CONTAMINATION) -> Tuple[IsolationForest, np.ndarray, np.ndarray]:
-    print(f"[*] Training IsolationForest (n_estimators=200, contamination={contamination}) …")
+    _log(f"[*] Training IsolationForest (n_estimators=200, contamination={contamination}) …")
     model = IsolationForest(
         n_estimators=200,
         max_samples="auto",
         contamination=contamination,
         random_state=42,
-        n_jobs=-1
+        n_jobs=1
     )
     model.fit(features)
     predictions = model.predict(features)
     raw_scores = model.decision_function(features)
     
     num_anomalies = (predictions == -1).sum()
-    print(f"[*] Flagged {num_anomalies} transactions as anomalies ({num_anomalies / len(features) * 100:.1f}%)")
+    _log(f"[*] Flagged {num_anomalies} transactions as anomalies ({num_anomalies / len(features) * 100:.1f}%)")
     return model, predictions, raw_scores
 
 def compute_risk_scores(raw_scores: np.ndarray) -> np.ndarray:
@@ -180,7 +205,7 @@ def generate_explanation(row_features: pd.Series, risk_score: float, original_ro
         reasons.append("High-frequency IP broadcast pattern")
         
     if row_features["is_micro_tx"] == 1:
-        reasons.append(f"Micro-transaction detected ({original_row['amount_btc']} BTC)")
+        reasons.append(f"Micro-transaction detected ({original_row.get('total_amount_btc', 0):.4f} BTC)")
         
     if row_features["is_high_risk_geo"] == 1:
         reasons.append(f"Originates from high-risk jurisdiction ({original_row['geo_country']})")
@@ -191,7 +216,7 @@ def generate_explanation(row_features: pd.Series, risk_score: float, original_ro
     return "Risk indicators: " + "; ".join(reasons) + "."
 
 def generate_all_explanations(df: pd.DataFrame, features: pd.DataFrame, predictions: np.ndarray, risk_scores: np.ndarray) -> pd.DataFrame:
-    print("[*] Generating graph-aware risk explanations …")
+    _log("[*] Generating graph-aware risk explanations …")
     result = df.copy()
     result["is_anomaly"] = (predictions == -1)
     result["risk_score"] = risk_scores
@@ -214,7 +239,7 @@ def generate_all_explanations(df: pd.DataFrame, features: pd.DataFrame, predicti
 
 def export_results(df: pd.DataFrame, filepath: str = OUTPUT_CSV) -> str:
     df.to_csv(filepath, index=False)
-    print(f"[*] Results saved to {filepath}")
+    _log(f"[*] Results saved to {filepath}")
     return filepath
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -226,9 +251,9 @@ def run_pipeline(
     output_csv: str = OUTPUT_CSV,
     contamination: float = CONTAMINATION,
 ) -> Tuple[pd.DataFrame, IsolationForest]:
-    print("=" * 60)
-    print("  Bitcoin Graph Anomaly Detection Engine")
-    print("=" * 60)
+    _log("=" * 60)
+    _log("  Bitcoin Graph Anomaly Detection Engine")
+    _log("=" * 60)
 
     df = load_data(input_csv)
     features, df = engineer_features(df)
@@ -238,16 +263,16 @@ def run_pipeline(
     export_results(enriched_df, output_csv)
 
     anomaly_df = enriched_df[enriched_df["is_anomaly"]]
-    print(f"\n{'─' * 60}")
-    print(f"  Summary")
-    print(f"{'─' * 60}")
-    print(f"  Total transactions:     {len(enriched_df)}")
-    print(f"  Flagged anomalies:      {len(anomaly_df)}")
-    print(f"  Avg risk (anomalies):   {anomaly_df['risk_score'].mean():.1f}%")
-    print(f"  Max risk score:         {anomaly_df['risk_score'].max():.1f}%")
-    print(f"  Output:                 {output_csv}")
-    print(f"{'─' * 60}")
-    print(f"  [✓] Pipeline complete.\n")
+    _log(f"\n{'─' * 60}")
+    _log(f"  Summary")
+    _log(f"{'─' * 60}")
+    _log(f"  Total transactions:     {len(enriched_df)}")
+    _log(f"  Flagged anomalies:      {len(anomaly_df)}")
+    _log(f"  Avg risk (anomalies):   {anomaly_df['risk_score'].mean():.1f}%")
+    _log(f"  Max risk score:         {anomaly_df['risk_score'].max():.1f}%")
+    _log(f"  Output:                 {output_csv}")
+    _log(f"{'─' * 60}")
+    _log(f"  [✓] Pipeline complete.\n")
 
     return enriched_df, model
 

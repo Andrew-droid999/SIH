@@ -92,7 +92,7 @@ The system operates as a **three-stage pipeline**, with each stage producing a t
 
 Generates a synthetic dataset of **2,000 Bitcoin transactions** that closely mimics real-world network traffic captured from Bitcoin full nodes. It simulates realistic entity ownership, co-spending inputs, and uses offline IP lookups.
 
-#### The 10 Data Columns
+#### The Data Columns
 
 | Column | Description | Example |
 |---|---|---|
@@ -104,7 +104,10 @@ Generates a synthetic dataset of **2,000 Bitcoin transactions** that closely mim
 | `txid` | 64-char hex transaction hash (SHA-256) | `fc5a00603d8f...` |
 | `input_addresses` | Array of Bitcoin wallet addresses (sender) | `1o7C...\|bc1q...` |
 | `output_addresses` | Array of Bitcoin wallet addresses (receiver) | `3Gmo...\|1Xw...` |
-| `amount_btc` | Transaction amount in BTC | `0.001` |
+| `input_amounts` | Array of input amounts in BTC | `0.0005\|0.0005` |
+| `output_amounts` | Array of output amounts in BTC | `0.0009` |
+| `fee` | Transaction network fee in BTC | `0.0001` |
+| `script_type` | Type of Bitcoin script used | `P2WPKH` |
 | `geo_country` | ISO country code of the source IP | `RU` |
 
 #### Offline GeoIP Integration

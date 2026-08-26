@@ -118,15 +118,24 @@ def generate_transaction(is_anomaly: bool, reader: geoip2.database.Reader) -> di
     if is_anomaly:
         entity = random.choice(ANOMALY_ENTITIES)
         src_ip = random.choice(SUSPICIOUS_SRC_IPS)
-        amount = random.choice(ANOMALY_AMOUNTS)
+        total_input = random.choice(ANOMALY_AMOUNTS)
     else:
         entity = random.choice(NORMAL_ENTITIES)
         src_ip = fake.ipv4_public()
-        amount = round(random.uniform(0.01, 5.0), 8)
+        total_input = round(random.uniform(0.01, 5.0), 8)
     
     # Co-spend 1 to 4 addresses from the entity's wallet
     num_inputs = min(len(entity), random.randint(1, 4))
     inputs = random.sample(entity, num_inputs)
+    
+    # Generate input amounts summing to total_input
+    input_amounts = []
+    remaining_input = total_input
+    for _ in range(num_inputs - 1):
+        amt = round(random.uniform(0.0001, remaining_input / 2), 8)
+        input_amounts.append(amt)
+        remaining_input -= amt
+    input_amounts.append(round(remaining_input, 8))
     
     # Outputs are usually random (sent to others or change address)
     num_outputs = random.randint(1, 3)
@@ -137,7 +146,23 @@ def generate_transaction(is_anomaly: bool, reader: geoip2.database.Reader) -> di
         num_outputs = random.randint(5, 10)
         outputs = [random_btc_address() for _ in range(num_outputs)]
 
+    # Calculate fee and output amounts
+    fee = round(random.uniform(0.00001, 0.001), 8)
+    total_output = max(0.0, total_input - fee)
+    
+    output_amounts = []
+    remaining_output = total_output
+    for _ in range(num_outputs - 1):
+        if remaining_output > 0:
+            amt = round(random.uniform(0.0001, remaining_output / 2), 8)
+            output_amounts.append(amt)
+            remaining_output -= amt
+        else:
+            output_amounts.append(0.0)
+    output_amounts.append(round(max(0.0, remaining_output), 8))
+
     country = get_country(src_ip, reader)
+    script_type = random.choice(["P2PKH", "P2SH", "P2WPKH", "P2TR"])
     
     return {
         "timestamp": random_timestamp(),
@@ -148,7 +173,10 @@ def generate_transaction(is_anomaly: bool, reader: geoip2.database.Reader) -> di
         "txid": random_txid(),
         "input_addresses": "|".join(inputs),
         "output_addresses": "|".join(outputs),
-        "amount_btc": amount,
+        "input_amounts": "|".join(f"{a:.8f}".rstrip("0").rstrip(".") if "." in f"{a:.8f}" else f"{a}" for a in input_amounts),
+        "output_amounts": "|".join(f"{a:.8f}".rstrip("0").rstrip(".") if "." in f"{a:.8f}" else f"{a}" for a in output_amounts),
+        "fee": fee,
+        "script_type": script_type,
         "geo_country": country,
     }
 

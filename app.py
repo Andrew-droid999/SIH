@@ -257,7 +257,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 REQUIRED_COLUMNS = [
     "timestamp", "src_ip", "dst_ip", "src_port", "dst_port",
-    "txid", "input_addresses", "output_addresses", "amount_btc", "geo_country",
+    "txid", "input_addresses", "output_addresses", "input_amounts", "output_amounts", "fee", "script_type", "geo_country",
 ]
 
 
@@ -288,8 +288,8 @@ with st.sidebar:
         "📂 Upload Bitcoin Traffic CSV",
         type=["csv"],
         help="Upload a raw CSV with columns: timestamp, src_ip, dst_ip, "
-             "src_port, dst_port, txid, input_address, output_address, "
-             "amount_btc, geo_country",
+             "src_port, dst_port, txid, input_addresses, output_addresses, "
+             "input_amounts, output_amounts, fee, script_type, geo_country",
     )
 
     # Contamination slider — let officers tune sensitivity
@@ -378,7 +378,8 @@ if uploaded_file is not None:
             )
 
     except Exception as e:
-        st.error(f"❌ **Error processing file:** {e}")
+        import traceback
+        st.error(f"❌ **Error processing file:** {e}\n\n```python\n{traceback.format_exc()}\n```")
         st.stop()
 else:
     st.warning("📁 Please upload a Bitcoin transaction CSV file in the sidebar to begin analysis.")
@@ -472,27 +473,49 @@ st.markdown(
         Anomalous entities and their immediate connections &nbsp;·&nbsp;
         <span style="color:#ef4444; font-weight:600;">● Red = flagged anomalies</span> &nbsp;·&nbsp;
         <span style="color:#f59e0b; font-weight:600;">◆ Amber = transactions</span> &nbsp;·&nbsp;
-        <span style="color:#a78bfa; font-weight:600;">■ Purple = wallet entities</span> &nbsp;·&nbsp;
+        <span style="color:#9b59b6; font-weight:600;">■ Purple = wallet entities</span> &nbsp;·&nbsp;
         <span style="color:#3b82f6; font-weight:600;">● Blue = context nodes</span>
     </p>
     """,
     unsafe_allow_html=True,
 )
 
+# ── Graph mode toggle ────────────────────────────────────────────────
+toggle_col1, toggle_col2 = st.columns([1, 3])
+with toggle_col1:
+    threats_only = st.toggle(
+        "🔍 Threat-Centric Mode",
+        value=True,
+        help="ON = show only flagged threats and their direct connections. "
+             "OFF = include surrounding normal traffic for full context.",
+    )
+with toggle_col2:
+    if threats_only:
+        st.markdown(
+            '<p style="color:#f87171; font-size:0.82rem; margin-top:0.5rem; font-weight:500;">'
+            '🚨 Showing <b>flagged anomalies only</b> — threats and their immediate IP/Entity neighbours</p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<p style="color:#60a5fa; font-size:0.82rem; margin-top:0.5rem; font-weight:500;">'
+            '📡 Showing <b>all traffic context</b> — threats highlighted within broader network activity</p>',
+            unsafe_allow_html=True,
+        )
 
-MAX_CONTEXT_NORMAL = 50  # cap on normal-traffic nodes shown for context
+MAX_CONTEXT_NORMAL = 50   # neighbours of threats shown in both modes
+MAX_CLEAN_SAMPLE = 40     # fully-clean normal nodes shown only in "all traffic" mode
 
 
-def build_network_graph(graph_df: pd.DataFrame) -> str:
+def build_network_graph(graph_df: pd.DataFrame, threats_only: bool = True) -> str:
     """
     Build a focused, intelligence-style tripartite network graph.
 
-    Strategy:
-      1. Include ALL flagged anomaly rows (IPs, TXIDs, Entities).
-      2. Add up to MAX_CONTEXT_NORMAL of the highest-risk normal rows
-         that share an IP or Entity with a flagged row (immediate
-         neighbours) so the analyst can see surrounding context.
-      3. Tune physics for wide spacing so the layout is readable.
+    Two modes controlled by threats_only:
+      True  (Threat-Centric) — Only anomalous rows + their immediate
+            context neighbours (normal rows sharing an IP/Entity).
+      False (All Traffic)    — Same as above PLUS a random sample of
+            fully-clean normal traffic to show the broader network shape.
     """
     net = Network(
         height="580px",
@@ -541,7 +564,7 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
     # ── 1. Collect ALL anomaly rows ──────────────────────────────────
     anom_rows = graph_df[graph_df["is_anomaly"] == True]
 
-    # Gather IPs and entities that are directly involved in anomalies
+    # Gather IPs and entities directly involved in anomalies
     anom_ips = set(anom_rows["src_ip"].unique())
     anom_entities = set()
     if "entity_id" in anom_rows.columns:
@@ -549,7 +572,6 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
 
     # ── 2. Pick context normal rows (neighbours of anomaly nodes) ───
     normal_rows = graph_df[graph_df["is_anomaly"] == False]
-    # Filter to normals that share an IP or Entity with an anomaly
     ip_mask = normal_rows["src_ip"].isin(anom_ips)
     entity_mask = (
         normal_rows["entity_id"].isin(anom_entities)
@@ -557,15 +579,22 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
         else pd.Series(False, index=normal_rows.index)
     )
     context_candidates = normal_rows[ip_mask | entity_mask]
-    # Sort by risk_score descending, take top N
     context_rows = context_candidates.sort_values(
         "risk_score", ascending=False
     ).head(MAX_CONTEXT_NORMAL)
 
-    # Combine into the rows we will actually plot
-    plot_df = pd.concat([anom_rows, context_rows]).drop_duplicates()
+    # ── 3. Optionally add clean-traffic sample (All Traffic mode) ───
+    if not threats_only:
+        already_selected = set(context_rows.index)
+        clean_pool = normal_rows[~normal_rows.index.isin(already_selected)]
+        clean_sample = clean_pool.sample(
+            n=min(MAX_CLEAN_SAMPLE, len(clean_pool)), random_state=42
+        )
+        plot_df = pd.concat([anom_rows, context_rows, clean_sample]).drop_duplicates()
+    else:
+        plot_df = pd.concat([anom_rows, context_rows]).drop_duplicates()
 
-    # ── 3. Build the graph ──────────────────────────────────────────
+    # ── 4. Build the graph ──────────────────────────────────────────
     added_nodes: set = set()
 
     for _, row in plot_df.iterrows():
@@ -573,24 +602,22 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
         src_ip = str(row["src_ip"])
         txid = str(row["txid"])
         entity = str(row.get("entity_id", "Unknown"))
-        amount = row["amount_btc"]
+        amount = row.get("total_amount_btc", sum(float(a) for a in str(row.get("input_amounts", "0")).split("|") if a.strip()))
         risk = row["risk_score"]
         country = row.get("geo_country", "")
 
         # ─── IP node ───
         if src_ip not in added_nodes:
             if is_anom or src_ip in anom_ips:
-                ip_color = {"background": "#ef4444", "border": "#dc2626",
-                            "highlight": {"background": "#f87171", "border": "#ef4444"}}
+                ip_color = "#ef4444"
                 ip_size = 24
                 ip_title = f"⚠️ SUSPICIOUS IP: {src_ip}"
             else:
-                ip_color = {"background": "#3b82f6", "border": "#2563eb",
-                            "highlight": {"background": "#60a5fa", "border": "#3b82f6"}}
+                ip_color = "#3b82f6"
                 ip_size = 14
                 ip_title = f"IP: {src_ip}"
             net.add_node(
-                src_ip, label=src_ip, group="ip",
+                src_ip, label=src_ip,
                 color=ip_color, size=ip_size, shape="dot",
                 title=ip_title,
             )
@@ -600,8 +627,7 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
         if txid not in added_nodes:
             tx_label = f"{txid[:6]}…{txid[-4:]}"
             if is_anom:
-                tx_color = {"background": "#f59e0b", "border": "#d97706",
-                            "highlight": {"background": "#fbbf24", "border": "#f59e0b"}}
+                tx_color = "#f59e0b"
                 tx_size = 16
                 tx_title = (
                     f"🚨 FLAGGED TX: {txid}\n"
@@ -609,12 +635,11 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
                     f"Risk: {risk}%\nCountry: {country}"
                 )
             else:
-                tx_color = {"background": "#6b7280", "border": "#4b5563",
-                            "highlight": {"background": "#9ca3af", "border": "#6b7280"}}
+                tx_color = "#6b7280"
                 tx_size = 8
                 tx_title = f"TX: {txid}\nAmount: {amount} BTC"
             net.add_node(
-                txid, label=tx_label, group="tx",
+                txid, label=tx_label,
                 color=tx_color, size=tx_size, shape="diamond",
                 title=tx_title,
             )
@@ -623,19 +648,19 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
         # ─── Entity node ───
         if entity not in added_nodes:
             if is_anom or entity in anom_entities:
-                ent_color = {"background": "#9b59b6", "border": "#ef4444",
-                             "highlight": {"background": "#b97ccf", "border": "#ef4444"}}
-                ent_size = 20
+                ent_color = "#9b59b6"
+                ent_size = 30
                 ent_title = f"⚠️ HIGH-RISK ENTITY: {entity}"
             else:
-                ent_color = {"background": "#9b59b6", "border": "#8e44ad",
-                             "highlight": {"background": "#b97ccf", "border": "#9b59b6"}}
-                ent_size = 12
+                ent_color = "#9b59b6"
+                ent_size = 22
                 ent_title = f"Entity Cluster: {entity}"
             net.add_node(
-                entity, label=entity, group="entity",
-                color=ent_color, size=ent_size, shape="box",
+                entity, label=entity,
+                color=ent_color, size=ent_size, shape="square",
                 title=ent_title,
+                borderWidth=3,
+                font={"size": 14, "color": "#ffffff", "bold": True},
             )
             added_nodes.add(entity)
 
@@ -656,7 +681,7 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
             title="Inputs owned by entity",
         )
 
-    # ── 4. Render to HTML string ────────────────────────────────────
+    # ── 5. Render to HTML string ────────────────────────────────────
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w")
     net.save_graph(tmp.name)
 
@@ -667,7 +692,7 @@ def build_network_graph(graph_df: pd.DataFrame) -> str:
 
 
 st.markdown('<div class="graph-container">', unsafe_allow_html=True)
-graph_html = build_network_graph(df)
+graph_html = build_network_graph(df, threats_only=threats_only)
 components.html(graph_html, height=600, scrolling=False)
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -699,7 +724,9 @@ if total_flagged > 0:
             "src_ip",
             "entity_id",
             "input_addresses",
-            "amount_btc",
+            "total_amount_btc",
+            "fee",
+            "script_type",
             "geo_country",
             "risk_score",
             "explanation",
@@ -717,7 +744,9 @@ if total_flagged > 0:
         "Source IP",
         "Entity ID",
         "Inputs (Sample)",
-        "Amount (BTC)",
+        "Total Vol (BTC)",
+        "Fee",
+        "Script",
         "Country",
         "Risk Score (%)",
         "Explanation",
