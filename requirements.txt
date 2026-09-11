@@ -1,10 +1,6 @@
-faker
-pandas
-numpy
-scikit-learn
-streamlit
-pyvis
-matplotlib
-networkx
-geoip2
-requests
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+streamlit==1.37.1
+pyvis==0.3.2
+networkx==3.3
