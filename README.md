@@ -23,6 +23,7 @@ MITHYA addresses the core challenges of crypto-investigations:
 | Feature | Description |
 |---|---|
 | **Mixer/CoinJoin Bypass** | Detects equal-output signatures (`equal_output_ratio=0.50`) and blocks false entity aggregation. |
+| **Change-Address Detection** | 5-factor heuristic (script-type match, unrounded remainder, decimal precision, novelty, asymmetry) links change outputs back to sender entity. |
 | **Port Risk Telemetry** | Scores network ports (`0.0` to `1.0`) to flag proxies and ephemeral routing, discarding static Geo-IP. |
 | **Behavioral ML** | 18 engineered features (e.g., Peel Chain Disparity, Fan-In/Out) fed into an Isolation Forest model. |
 | **Institutional Whitelist** | Pre-clears known safe addresses via `institutional_whitelist.csv` to eliminate false positives. |
@@ -41,8 +42,8 @@ MITHYA addresses the core challenges of crypto-investigations:
 │ transaction_adapter │       │     ml_engine.py     │       │       app.py          │
 │ .py                 │       │                      │       │                       │
 │ • BitcoinCSVAdapter │       │ • Mixer bypass       │       │ • Pyvis network graph │
-│ • Schema validation │       │ • Wallet clustering  │       │ • Metric cards        │
-│                     │       │ • Feature extraction │       │ • XAI data table      │
+│ • Schema validation │       │ • Change-addr detect │       │ • Metric cards        │
+│                     │       │ • Wallet clustering  │       │ • XAI data table      │
 │                     │       │ • IsolationForest    │       │ • Threat toggle       │
 │                     │       │ • Whitelist filter   │       │                       │
 │          ▲          │       │          ▼           │       │                       │
@@ -53,7 +54,7 @@ MITHYA addresses the core challenges of crypto-investigations:
 
 **Data Flow:**
 1. `transaction_adapter.py` ingests `bitcoin_traffic.csv` via the `BitcoinCSVAdapter` and normalizes the pipe-delimited addresses.
-2. `ml_engine.py` builds a NetworkX graph, filters out mixers, clusters wallets via Union-Find, engineers 18 features, trains an `IsolationForest`, flags anomalies, applies the `institutional_whitelist.csv`, and optionally outputs `flagged_transactions.csv`.
+2. `ml_engine.py` builds a NetworkX graph, filters out mixers, detects change addresses and links them back to sender entities, clusters wallets via Union-Find, engineers 18 features, trains an `IsolationForest`, flags anomalies, applies the `institutional_whitelist.csv`, and optionally outputs `flagged_transactions.csv`.
 3. `app.py` runs a Streamlit dashboard that allows CSV upload, invokes the ML pipeline via the polymorphic adapter, and visualizes the results.
 
 ---
@@ -212,6 +213,7 @@ SIH-2026-2/
 | Entity/transaction graph | `build_entity_graph()` in `ml_engine.py` | ✅ Completed |
 | AI anomaly detection | `IsolationForest` on 18 features | ✅ Completed |
 | Wallet clustering | Union-Find via `nx.connected_components` | ✅ Completed |
+| Change-address detection | `detect_change_address()` 5-factor heuristic | ✅ Completed |
 | Explainable alerts | `generate_explanation()` logic | ✅ Completed |
 | Interactive UI | `app.py` Streamlit + PyVis | ✅ Completed |
 
@@ -221,4 +223,4 @@ SIH-2026-2/
 
 *   **Ethereum Integration:** Implement an `EthereumAdapter` to support account/nonce-based anomaly tracing.
 *   **Real-time Mempool Ingestion:** Shift from CSV batch-processing to subscribing to a live Bitcoin Core RPC node.
-*   **Change-Address Detection:** Implement advanced heuristic rules to refine entity clustering beyond standard Common-Input ownership.
+*   **Temporal Velocity Features:** Detect burst-sending patterns via sliding-window analysis over transaction timestamps.
