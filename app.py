@@ -25,10 +25,12 @@ import pandas as pd
 import streamlit as st
 # pyrefly: ignore [missing-import]
 import streamlit.components.v1 as components
+# pyrefly: ignore [missing-import]
 from pyvis.network import Network
 
-# Import the AI engine for in-app analysis
+# Import the AI engine and cross-chain adapter layer
 from ml_engine import run_pipeline_from_df
+from transaction_adapter import BitcoinCSVAdapter
 
 # ---------------------------------------------------------------------------
 # Page configuration (must be first Streamlit call)
@@ -335,13 +337,20 @@ def load_preanalysed_data(filepath: str = "flagged_transactions.csv") -> pd.Data
     return pd.read_csv(filepath)
 
 
+# ── Cross-chain adapter (swap this line for a different chain) ──
+_adapter = BitcoinCSVAdapter()
+
+
 def run_ai_on_upload(raw_df: pd.DataFrame, contamination: float) -> pd.DataFrame:
     """
-    Run the full AI pipeline on an uploaded DataFrame.
-    Returns the enriched DataFrame with anomaly flags, risk scores,
-    and explanations.
+    Run the full AI pipeline on an uploaded DataFrame via the
+    polymorphic adapter.  Swapping ``_adapter`` to an
+    ``EthereumAdapter`` would make this function work on ETH
+    data with zero changes.
     """
-    enriched_df, _model = run_pipeline_from_df(raw_df, contamination=contamination)
+    enriched_df, _model = _adapter.run_pipeline_from_df(
+        raw_df, contamination=contamination,
+    )
     return enriched_df
 
 
@@ -632,7 +641,7 @@ def build_network_graph(graph_df: pd.DataFrame, threats_only: bool = True) -> st
                 tx_title = (
                     f"🚨 FLAGGED TX: {txid}\n"
                     f"Amount: {amount} BTC\n"
-                    f"Risk: {risk}%\nCountry: {country}"
+                    f"Risk: {risk}%\nFirst-Seen Node: {country}"
                 )
             else:
                 tx_color = "#6b7280"
@@ -674,7 +683,7 @@ def build_network_graph(graph_df: pd.DataFrame, threats_only: bool = True) -> st
 
         net.add_edge(
             src_ip, txid, color=edge_color, width=edge_width,
-            title=f"Broadcast ({country})",
+            title=f"Propagation node: {country}",
         )
         net.add_edge(
             entity, txid, color=edge_color, width=edge_width,
@@ -747,7 +756,7 @@ if total_flagged > 0:
         "Total Vol (BTC)",
         "Fee",
         "Script",
-        "Country",
+        "First-Seen Propagation Node",
         "Risk Score (%)",
         "Explanation",
     ]

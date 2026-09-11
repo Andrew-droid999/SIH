@@ -9,11 +9,14 @@ Implements a full data pipeline:
 4. Trains an IsolationForest to detect anomalous graph behavior (layering).
 5. Generates human-readable explanations (XAI) for flagged threats.
 
-Can be run standalone via CLI or imported into Streamlit.
+Can be run standalone via CLI, imported into Streamlit, or invoked
+through a :class:`~transaction_adapter.BaseTransactionAdapter` for
+cross-chain polymorphic usage.
 """
 
+import os
 import warnings
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Set
 
 import pandas as pd
 import numpy as np
@@ -37,10 +40,25 @@ def _log(msg: str) -> None:
 
 INPUT_CSV = "bitcoin_traffic.csv"
 OUTPUT_CSV = "flagged_transactions.csv"
+WHITELIST_CSV = "institutional_whitelist.csv"
 CONTAMINATION = 0.05
 
-HIGH_RISK_COUNTRIES = {"RU", "CN", "IR", "KP", "SY", "VE"}
 MICRO_TX_THRESHOLD = 0.006
+
+# ── Port-risk scoring constants ─────────────────────────────────────────
+# Standard Bitcoin P2P ports (mainnet + testnet) → baseline risk = 0.0
+STANDARD_P2P_PORTS = {8332, 8333, 8334, 18332, 18333, 18444, 38332, 38333}
+
+# Ports commonly associated with proxies, SOCKS, or Tor hidden services
+KNOWN_PROXY_TOR_PORTS = {
+    9050, 9051, 9150,          # Tor SOCKS / control
+    1080,                       # SOCKS5
+    3128, 8080, 8888,          # HTTP proxies
+    443,                        # TLS — often used for Tor bridges / tunneling
+}
+
+# Ports above this threshold are treated as ephemeral / suspicious
+EPHEMERAL_PORT_FLOOR = 49152
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. DATA LOADING
@@ -52,27 +70,194 @@ def load_data(filepath: str = INPUT_CSV) -> pd.DataFrame:
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2. GRAPH CONSTRUCTION & WALLET CLUSTERING
+# 2a. COINJOIN / MIXER DETECTION (pre-clustering filter)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def is_mixer_transaction(
+    row,
+    min_participants: int = 10,
+    equal_output_ratio: float = 0.50,
+    rel_tolerance: float = 0.01,
+) -> bool:
+    """
+    Detect CoinJoin / Mixer transactions before wallet clustering.
+
+    A mixer transaction is characterised by:
+      1. A high fan-in **and** fan-out (>= *min_participants* unique
+         inputs **or** outputs).
+      2. A large share of outputs having *near-identical* values
+         (>= *equal_output_ratio* of all outputs).
+
+    The "near-identical" check uses *rel_tolerance* (default 1 %)
+    so that rounding artefacts in BTC amounts don't defeat the
+    heuristic.
+
+    Parameters
+    ----------
+    row : pd.Series or dict-like
+        A single transaction row containing at minimum the keys
+        ``input_amounts`` and ``output_amounts`` (pipe-delimited
+        strings of float values).  ``input_addresses`` and
+        ``output_addresses`` are also accepted for participant
+        counting.
+    min_participants : int, default 10
+        Minimum number of distinct inputs **or** outputs required
+        to even consider the transaction a potential mix.
+    equal_output_ratio : float, default 0.50
+        Fraction of outputs that must share the same (within
+        tolerance) value to classify the tx as a mix.
+    rel_tolerance : float, default 0.01
+        Maximum relative difference between two output values for
+        them to be considered "equal".  0.01 → ±1 %.
+
+    Returns
+    -------
+    bool
+        ``True`` if the transaction exhibits mixer/CoinJoin
+        characteristics; ``False`` otherwise.
+
+    Notes
+    -----
+    This function is intentionally conservative: both the
+    participant-count gate **and** the equal-output gate must
+    trigger.  Normal transactions with many UTXOs but diverse
+    output values will **not** be flagged.
+    """
+    # ------------------------------------------------------------------
+    # Helper: safely split a pipe-delimited string into a list of floats
+    # ------------------------------------------------------------------
+    def _parse_amounts(raw) -> list:
+        if raw is None:
+            return []
+        text = str(raw).strip()
+        if text in ("", "nan", "None"):
+            return []
+        amounts = []
+        for token in text.split("|"):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                amounts.append(float(token))
+            except (ValueError, TypeError):
+                continue          # skip unparseable fragments
+        return amounts
+
+    def _count_participants(raw) -> int:
+        """Count pipe-delimited addresses (or amounts as fallback)."""
+        if raw is None:
+            return 0
+        text = str(raw).strip()
+        if text in ("", "nan", "None"):
+            return 0
+        return len([t for t in text.split("|") if t.strip()])
+
+    # ------------------------------------------------------------------
+    # 1. Parse amounts
+    # ------------------------------------------------------------------
+    try:
+        input_amounts  = _parse_amounts(row.get("input_amounts"))
+        output_amounts = _parse_amounts(row.get("output_amounts"))
+    except Exception:
+        return False              # corrupt / missing row → safe default
+
+    if not output_amounts:
+        return False              # nothing to analyse
+
+    # ------------------------------------------------------------------
+    # 2. Participant-count gate
+    # ------------------------------------------------------------------
+    #    Prefer address columns when available; fall back to amounts.
+    n_inputs  = _count_participants(row.get("input_addresses")) or len(input_amounts)
+    n_outputs = _count_participants(row.get("output_addresses")) or len(output_amounts)
+
+    if max(n_inputs, n_outputs) < min_participants:
+        return False              # too few participants → normal tx
+
+    # ------------------------------------------------------------------
+    # 3. Equal-output pattern detection
+    # ------------------------------------------------------------------
+    #    Bucket outputs with relative tolerance: two values v1, v2 are
+    #    "equal" iff  |v1 − v2| / max(|v1|, |v2|) <= rel_tolerance.
+    #
+    #    Implementation: sort outputs, then greedily assign each value
+    #    to the current bucket if it is within tolerance of the bucket
+    #    representative; otherwise start a new bucket.  Finally, the
+    #    largest bucket determines the dominant equal-output cluster.
+    sorted_outputs = sorted(output_amounts)
+    buckets: list = []            # list of (representative, count)
+    for val in sorted_outputs:
+        if buckets:
+            rep, cnt = buckets[-1]
+            denominator = max(abs(rep), abs(val), 1e-12)  # avoid div-zero
+            if abs(val - rep) / denominator <= rel_tolerance:
+                buckets[-1] = (rep, cnt + 1)
+                continue
+        buckets.append((val, 1))
+
+    largest_bucket = max(cnt for _, cnt in buckets)
+    dominant_ratio = largest_bucket / len(output_amounts)
+
+    return dominant_ratio >= equal_output_ratio
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2b. GRAPH CONSTRUCTION & WALLET CLUSTERING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
     """
-    Builds the Entity-Transaction graph and clusters wallets using the 
-    Common-Input-Ownership heuristic.
+    Builds the Entity-Transaction graph and clusters wallets using the
+    Common-Input-Ownership heuristic, with a **CoinJoin / Mixer bypass**.
+
+    For each transaction row the function first calls
+    :func:`is_mixer_transaction`.  If the row exhibits mixer
+    characteristics the input addresses are added as **isolated nodes**
+    (no edges), preventing the Union-Find from falsely merging
+    unrelated wallets that merely participated in the same mix.
+
+    Returns
+    -------
+    address_graph : nx.Graph
+        The co-input address graph.
+    entity_map : dict[str, str]
+        Mapping ``{address: "Entity_<id>"}``.
     """
     _log("[*] Building Entity/Transaction graph with NetworkX ...")
-    
-    # Bipartite mapping to cluster addresses
+
     address_graph = nx.Graph()
-    
+
+    mixer_bypassed = 0       # counter for filtered CoinJoin / Mixer txs
+    total_rows     = 0
+
     for idx, row in df.iterrows():
+        total_rows += 1
         inputs = str(row["input_addresses"]).split("|")
-        # Link all co-inputs together in the address graph to form entities
+
+        # ── Mixer bypass check ──────────────────────────────────────
+        if is_mixer_transaction(row):
+            # Add every input as an isolated node so it still appears
+            # in the graph (important for downstream feature lookups)
+            # but do NOT draw edges — this breaks the false link.
+            for addr in inputs:
+                addr = addr.strip()
+                if addr:
+                    address_graph.add_node(addr)
+            mixer_bypassed += 1
+            continue
+        # ─────────────────────────────────────────────────────────────
+
+        # Standard Common-Input-Ownership: link all co-inputs
         for i in range(len(inputs)):
             address_graph.add_node(inputs[i])
             for j in range(i + 1, len(inputs)):
                 address_graph.add_edge(inputs[i], inputs[j])
-                    
+
+    _log(
+        f"[*] Mixer bypass: {mixer_bypassed}/{total_rows} transactions "
+        f"identified as CoinJoin/Mixer and excluded from clustering."
+    )
+
     # Union Find (Connected Components) for entity clustering
     _log("[*] Running Union-Find wallet clustering (Common-Input-Ownership) ...")
     entity_map = {}
@@ -80,7 +265,7 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
     for entity_id, comp in enumerate(components):
         for addr in comp:
             entity_map[addr] = f"Entity_{entity_id}"
-            
+
     _log(f"[*] Clustered {len(address_graph.nodes)} addresses into {len(components)} entities.")
     return address_graph, entity_map
 
@@ -89,7 +274,159 @@ def _frequency_encode(series: pd.Series) -> pd.Series:
     return series.map(freq_map)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. FEATURE ENGINEERING
+# 2c. PORT-RISK SCORING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def score_port_risk(port) -> float:
+    """
+    Return a risk score in [0.0, 1.0] for a network port.
+
+    Tiers
+    -----
+    * **0.0** — Standard Bitcoin P2P port (8332, 8333, …)
+    * **0.3** — Any other well-known / registered port (< 49152)
+    * **0.6** — Ephemeral / high-range port (>= 49152), commonly
+      used by NAT, proxies, or automated tools
+    * **1.0** — Known proxy / Tor / tunneling port (9050, 1080, …)
+
+    Returns 0.5 (neutral) for unparseable or missing values.
+    """
+    try:
+        p = int(port)
+    except (ValueError, TypeError):
+        return 0.5               # missing / corrupt → neutral
+
+    if p in STANDARD_P2P_PORTS:
+        return 0.0               # baseline — expected traffic
+    if p in KNOWN_PROXY_TOR_PORTS:
+        return 1.0               # highest penalty
+    if p >= EPHEMERAL_PORT_FLOOR:
+        return 0.6               # ephemeral range — moderate risk
+    return 0.3                    # other well-known port — low risk
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3a. BEHAVIORAL FEATURE EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_pipe_amounts(raw) -> List[float]:
+    """Safely split a pipe-delimited string into a list of floats."""
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if text in ("", "nan", "None"):
+        return []
+    result = []
+    for token in text.split("|"):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            result.append(float(token))
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def _count_pipe_elements(raw) -> int:
+    """Count non-empty elements in a pipe-delimited string."""
+    if raw is None:
+        return 0
+    text = str(raw).strip()
+    if text in ("", "nan", "None"):
+        return 0
+    return len([t for t in text.split("|") if t.strip()])
+
+
+def compute_peel_chain_disparity(output_amounts_str) -> float:
+    """
+    Detect peel-chain laundering structure.
+
+    In a peel chain the sender peels off a small payment to the
+    recipient and sends the bulk back to a change address.  This
+    produces a characteristic **two-output** pattern where one
+    output is a micro-fraction (< 1 %) and the other captures the
+    remaining balance (> 99 %).
+
+    Returns
+    -------
+    float
+        A disparity score in ``[0.0, 1.0]``:
+        * **1.0** — perfect peel-chain signature (one output < 1 %,
+          the other > 99 % of total output value)
+        * **0.0** — no peel pattern detected (single output, equal
+          split, or more than two outputs)
+
+    The score for two outputs is ``max_share - min_share``, yielding
+    values near 1.0 for extreme disparity and near 0.0 for even
+    splits.  Transactions with != 2 outputs return 0.0 because
+    the peel-chain heuristic is defined only for the two-output case.
+    """
+    amounts = _parse_pipe_amounts(output_amounts_str)
+    if len(amounts) != 2:
+        return 0.0                # heuristic applies to 2-output txs only
+
+    total = sum(amounts)
+    if total <= 0:
+        return 0.0
+
+    shares = [a / total for a in amounts]
+    max_share = max(shares)
+    min_share = min(shares)
+
+    # Classic peel: one side < 1 %, other > 99 %
+    if min_share < 0.01 and max_share > 0.99:
+        return round(max_share - min_share, 6)
+    return 0.0
+
+
+def compute_fan_in_out(row) -> Tuple[int, int, float]:
+    """
+    Compute fan-in, fan-out, and their ratio for a transaction row.
+
+    Returns
+    -------
+    fan_in : int
+        Number of distinct input addresses.
+    fan_out : int
+        Number of distinct output addresses.
+    fan_ratio : float
+        ``fan_in / fan_out`` (clamped to 0.0 if fan_out == 0).
+        * **ratio >> 1** → mass consolidation (many inputs → few outputs)
+        * **ratio << 1** → rapid dispersal  (few inputs → many outputs)
+        * **ratio ≈ 1**  → balanced / normal
+    """
+    fan_in  = _count_pipe_elements(row.get("input_addresses"))
+    fan_out = _count_pipe_elements(row.get("output_addresses"))
+    fan_ratio = (fan_in / fan_out) if fan_out > 0 else 0.0
+    return fan_in, fan_out, round(fan_ratio, 4)
+
+
+def compute_fee_rate_urgency(row) -> float:
+    """
+    Calculate ``fee / total_input_amount``.
+
+    A disproportionately high fee relative to the transaction value
+    signals urgency (the sender is overpaying miners to get fast
+    confirmation), which is a common pattern in time-sensitive
+    laundering hops.
+
+    Returns 0.0 when fee or input amounts are missing / zero.
+    """
+    try:
+        fee = float(row.get("fee", 0))
+    except (ValueError, TypeError):
+        return 0.0
+
+    total_input = sum(_parse_pipe_amounts(row.get("input_amounts")))
+    if total_input <= 0 or fee <= 0:
+        return 0.0
+
+    return round(fee / total_input, 8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. FEATURE ENGINEERING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -120,10 +457,11 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     features["entity_tx_freq"] = _frequency_encode(df["entity_id"])
 
-    # --- Standard Network & Geography Features ---
+    # --- Standard Network Features ---
+    #     NOTE: geo_country is kept on the DataFrame for display only;
+    #     it is NOT fed into the ML feature matrix because physical
+    #     locations are trivially spoofed via VPN / proxy.
     features["src_ip_freq"] = _frequency_encode(df["src_ip"])
-    features["geo_freq"] = _frequency_encode(df["geo_country"])
-    features["is_high_risk_geo"] = df["geo_country"].isin(HIGH_RISK_COUNTRIES).astype(int)
 
     # Calculate total input amount for each transaction
     def calc_total(amount_str):
@@ -131,22 +469,56 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
             return sum(float(a) for a in str(amount_str).split("|") if a.strip())
         except:
             return 0.0
-    
+
     df["total_amount_btc"] = df["input_amounts"].apply(calc_total)
 
-    # --- Amount & Port Features ---
+    # --- Amount Features ---
     scaler = MinMaxScaler()
     features["amount_btc_scaled"] = scaler.fit_transform(df[["total_amount_btc"]])
     if "fee" in df.columns:
         features["fee_scaled"] = scaler.fit_transform(df[["fee"]])
     features["is_micro_tx"] = (df["total_amount_btc"] < MICRO_TX_THRESHOLD).astype(int)
-    
+
     # Script type frequency encoding
     if "script_type" in df.columns:
         features["script_type_freq"] = _frequency_encode(df["script_type"])
-    
-    standard_ports = {8332, 8333, 8334, 18332, 18333}
-    features["src_port_is_std"] = df["src_port"].isin(standard_ports).astype(int)
+
+    # --- Port-Risk Features (replaces binary src_port_is_std) ---
+    features["src_port_risk"] = df["src_port"].apply(score_port_risk)
+    features["dst_port_risk"] = df["dst_port"].apply(score_port_risk)
+    features["port_risk_combined"] = (
+        features["src_port_risk"] * 0.6 + features["dst_port_risk"] * 0.4
+    ).round(4)
+
+    # --- Behavioral Crime-Detection Features ---
+
+    # 1) Peel Chain Disparity
+    features["peel_chain_disparity"] = df["output_amounts"].apply(
+        compute_peel_chain_disparity
+    )
+
+    # 2) Fan-In / Fan-Out Ratios
+    fan_data = df.apply(compute_fan_in_out, axis=1, result_type="expand")
+    fan_data.columns = ["fan_in", "fan_out", "fan_ratio"]
+    features["fan_in"]    = fan_data["fan_in"]
+    features["fan_out"]   = fan_data["fan_out"]
+    features["fan_ratio"] = fan_data["fan_ratio"]
+
+    # 3) Fee Rate Urgency
+    features["fee_rate_urgency"] = df.apply(compute_fee_rate_urgency, axis=1)
+
+    # 4) Transaction Value Z-Score
+    mean_val = df["total_amount_btc"].mean()
+    std_val  = df["total_amount_btc"].std()
+    if std_val > 0:
+        features["value_zscore"] = (
+            (df["total_amount_btc"] - mean_val) / std_val
+        ).round(4)
+    else:
+        features["value_zscore"] = 0.0
+
+    # Take absolute Z-score — both extremes are suspicious
+    features["value_zscore_abs"] = features["value_zscore"].abs()
 
     _log(f"[*] Engineered {features.shape[1]} features: {list(features.columns)}")
     return features, df
@@ -206,9 +578,47 @@ def generate_explanation(row_features: pd.Series, risk_score: float, original_ro
         
     if row_features["is_micro_tx"] == 1:
         reasons.append(f"Micro-transaction detected ({original_row.get('total_amount_btc', 0):.4f} BTC)")
-        
-    if row_features["is_high_risk_geo"] == 1:
-        reasons.append(f"Originates from high-risk jurisdiction ({original_row['geo_country']})")
+
+    if row_features["port_risk_combined"] >= 0.6:
+        src_p = original_row.get('src_port', '?')
+        dst_p = original_row.get('dst_port', '?')
+        reasons.append(
+            f"Anomalous port profile (src:{src_p} / dst:{dst_p}) — "
+            f"possible proxy/Tor/tunneling"
+        )
+
+    if row_features.get("peel_chain_disparity", 0) > 0:
+        reasons.append(
+            f"Peel-chain output structure detected "
+            f"(disparity={row_features['peel_chain_disparity']:.4f}) — "
+            f"classic layering signature"
+        )
+
+    fan_ratio = row_features.get("fan_ratio", 1.0)
+    fan_in  = int(row_features.get("fan_in", 0))
+    fan_out = int(row_features.get("fan_out", 0))
+    if fan_ratio > 5:
+        reasons.append(
+            f"Mass consolidation ({fan_in} inputs → {fan_out} outputs, "
+            f"ratio={fan_ratio:.1f})"
+        )
+    elif fan_ratio < 0.2 and fan_out > 5:
+        reasons.append(
+            f"Rapid dispersal ({fan_in} inputs → {fan_out} outputs, "
+            f"ratio={fan_ratio:.2f})"
+        )
+
+    if row_features.get("fee_rate_urgency", 0) > 0.05:
+        reasons.append(
+            f"Fee-rate urgency ({row_features['fee_rate_urgency']:.4f}) — "
+            f"miner-priority overpayment suggesting time-sensitive hop"
+        )
+
+    if row_features.get("value_zscore_abs", 0) > 2.5:
+        reasons.append(
+            f"Volume outlier (Z-score={row_features.get('value_zscore', 0):.2f}) — "
+            f"statistically anomalous transaction value"
+        )
 
     if not reasons:
         reasons.append("Anomalous structural graph relationships detected by ML")
@@ -234,6 +644,145 @@ def generate_all_explanations(df: pd.DataFrame, features: pd.DataFrame, predicti
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 5a. INSTITUTIONAL WHITELIST FILTER (post-scoring, pre-export)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_institutional_whitelist(
+    filepath: str = WHITELIST_CSV,
+) -> Tuple[Set[str], Dict[str, str]]:
+    """
+    Load known institutional wallet addresses from a CSV file.
+
+    The CSV must have at least an ``address`` column.  An optional
+    ``institution`` column is used to label matched transactions.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the whitelist CSV.  If the file is missing or empty
+        an empty set is returned — the pipeline continues without
+        filtering.
+
+    Returns
+    -------
+    addresses : set[str]
+        The set of whitelisted addresses (lowercased for
+        case-insensitive matching).
+    labels : dict[str, str]
+        Mapping ``{address_lower: institution_name}``.
+    """
+    if not os.path.isfile(filepath):
+        _log(f"[!] Whitelist file '{filepath}' not found — skipping institutional filter.")
+        return set(), {}
+
+    try:
+        wl = pd.read_csv(filepath)
+    except Exception as exc:
+        _log(f"[!] Failed to read whitelist '{filepath}': {exc} — skipping.")
+        return set(), {}
+
+    if "address" not in wl.columns:
+        _log("[!] Whitelist CSV missing 'address' column — skipping.")
+        return set(), {}
+
+    # Normalise: strip whitespace, lowercase for case-insensitive matching
+    wl["address"] = wl["address"].astype(str).str.strip().str.lower()
+    wl = wl[wl["address"].ne("") & wl["address"].ne("nan")]
+
+    labels = {}
+    if "institution" in wl.columns:
+        labels = dict(zip(wl["address"], wl["institution"].astype(str)))
+
+    addresses = set(wl["address"])
+    _log(f"[*] Loaded {len(addresses)} institutional addresses from '{filepath}'.")
+    return addresses, labels
+
+
+def apply_institutional_whitelist(
+    df: pd.DataFrame,
+    whitelist: Set[str] | None = None,
+    labels: Dict[str, str] | None = None,
+    whitelist_csv: str = WHITELIST_CSV,
+) -> pd.DataFrame:
+    """
+    Post-scoring filter: override risk for transactions involving
+    known institutional wallets.
+
+    For every row where **any** address in ``input_addresses`` or
+    ``output_addresses`` appears in the whitelist:
+
+    * ``risk_score``  → **0.0**
+    * ``is_anomaly``  → **False**
+    * ``explanation`` → **"Regulated Entity (<institution>)"**
+    * ``entity_id``   → **"Regulated Entity"** (if column exists)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The enriched DataFrame (output of ``generate_all_explanations``).
+        Must contain ``risk_score``, ``is_anomaly``, and ``explanation``.
+    whitelist : set[str] | None
+        Pre-loaded whitelist addresses.  If ``None`` the whitelist is
+        loaded fresh from *whitelist_csv*.
+    labels : dict[str, str] | None
+        Address → institution name mapping.  Loaded alongside
+        *whitelist* when ``None``.
+    whitelist_csv : str
+        Path used when *whitelist* is ``None``.
+
+    Returns
+    -------
+    pd.DataFrame
+        The same DataFrame with institutional rows overridden.
+    """
+    if whitelist is None:
+        whitelist, labels = load_institutional_whitelist(whitelist_csv)
+    if labels is None:
+        labels = {}
+
+    if not whitelist:
+        return df                 # nothing to filter
+
+    def _has_whitelisted_address(raw) -> Tuple[bool, str]:
+        """Check if any pipe-delimited address is in the whitelist."""
+        if raw is None:
+            return False, ""
+        text = str(raw).strip()
+        if text in ("", "nan", "None"):
+            return False, ""
+        for addr in text.split("|"):
+            addr_clean = addr.strip().lower()
+            if addr_clean in whitelist:
+                return True, labels.get(addr_clean, "Unknown Institution")
+        return False, ""
+
+    overridden = 0
+
+    for idx in df.index:
+        matched, institution = _has_whitelisted_address(
+            df.at[idx, "input_addresses"]
+        )
+        if not matched:
+            matched, institution = _has_whitelisted_address(
+                df.at[idx, "output_addresses"]
+            )
+
+        if matched:
+            df.at[idx, "risk_score"]  = 0.0
+            df.at[idx, "is_anomaly"] = False
+            df.at[idx, "explanation"] = f"Regulated Entity ({institution})."
+            if "entity_id" in df.columns:
+                df.at[idx, "entity_id"] = "Regulated Entity"
+            overridden += 1
+
+    _log(
+        f"[*] Institutional whitelist: {overridden}/{len(df)} transactions "
+        f"matched and cleared (risk → 0.0)."
+    )
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 6. EXPORT
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -250,16 +799,36 @@ def run_pipeline(
     input_csv: str = INPUT_CSV,
     output_csv: str = OUTPUT_CSV,
     contamination: float = CONTAMINATION,
+    adapter=None,
 ) -> Tuple[pd.DataFrame, IsolationForest]:
+    """
+    Full detection pipeline.
+
+    Parameters
+    ----------
+    adapter : BaseTransactionAdapter | None
+        If provided, the adapter handles load / normalise / extract.
+        Otherwise the legacy code path is used (backward-compatible).
+    """
     _log("=" * 60)
     _log("  Bitcoin Graph Anomaly Detection Engine")
     _log("=" * 60)
 
+    if adapter is not None:
+        return adapter.run_pipeline(
+            input_csv, contamination=contamination, output_csv=output_csv,
+        )
+
+    # ── Legacy path (no adapter) ─────────────────────────────────
     df = load_data(input_csv)
     features, df = engineer_features(df)
     model, predictions, raw_scores = train_model(features, contamination=contamination)
     risk_scores = compute_risk_scores(raw_scores)
     enriched_df = generate_all_explanations(df, features, predictions, risk_scores)
+
+    # ── Institutional Whitelist Override ──
+    enriched_df = apply_institutional_whitelist(enriched_df)
+
     export_results(enriched_df, output_csv)
 
     anomaly_df = enriched_df[enriched_df["is_anomaly"]]
@@ -268,8 +837,12 @@ def run_pipeline(
     _log(f"{'─' * 60}")
     _log(f"  Total transactions:     {len(enriched_df)}")
     _log(f"  Flagged anomalies:      {len(anomaly_df)}")
-    _log(f"  Avg risk (anomalies):   {anomaly_df['risk_score'].mean():.1f}%")
-    _log(f"  Max risk score:         {anomaly_df['risk_score'].max():.1f}%")
+    if len(anomaly_df) > 0:
+        _log(f"  Avg risk (anomalies):   {anomaly_df['risk_score'].mean():.1f}%")
+        _log(f"  Max risk score:         {anomaly_df['risk_score'].max():.1f}%")
+    else:
+        _log(f"  Avg risk (anomalies):   N/A")
+        _log(f"  Max risk score:         N/A")
     _log(f"  Output:                 {output_csv}")
     _log(f"{'─' * 60}")
     _log(f"  [✓] Pipeline complete.\n")
@@ -279,7 +852,21 @@ def run_pipeline(
 def run_pipeline_from_df(
     df: pd.DataFrame,
     contamination: float = CONTAMINATION,
+    adapter=None,
 ) -> Tuple[pd.DataFrame, IsolationForest]:
+    """
+    Run the pipeline on an already-loaded DataFrame.
+
+    Parameters
+    ----------
+    adapter : BaseTransactionAdapter | None
+        If provided, the adapter handles normalise / extract.
+        Otherwise the legacy code path is used (backward-compatible).
+    """
+    if adapter is not None:
+        return adapter.run_pipeline(df, contamination=contamination)
+
+    # ── Legacy path (no adapter) ──
     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
@@ -288,7 +875,26 @@ def run_pipeline_from_df(
     risk_scores = compute_risk_scores(raw_scores)
     enriched_df = generate_all_explanations(df, features, predictions, risk_scores)
 
+    # ── Institutional Whitelist Override ──
+    enriched_df = apply_institutional_whitelist(enriched_df)
+
     return enriched_df, model
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. ADAPTER FACTORY (convenience re-export)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_adapter(chain: str = "bitcoin"):
+    """
+    Convenience re-export of :func:`transaction_adapter.get_adapter`.
+
+    >>> adapter = get_adapter("bitcoin")
+    >>> enriched_df, model = adapter.run_pipeline("data.csv")
+    """
+    from transaction_adapter import get_adapter as _get_adapter
+    return _get_adapter(chain)
+
 
 if __name__ == "__main__":
     run_pipeline()
