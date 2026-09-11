@@ -902,8 +902,15 @@ def load_institutional_whitelist(
     wl = wl[wl["address"].ne("") & wl["address"].ne("nan")]
 
     labels = {}
+    # Support both column names: 'institution' (legacy) and 'entity_name' (generate_data.py)
+    label_col = None
     if "institution" in wl.columns:
-        labels = dict(zip(wl["address"], wl["institution"].astype(str)))
+        label_col = "institution"
+    elif "entity_name" in wl.columns:
+        label_col = "entity_name"
+
+    if label_col is not None:
+        labels = dict(zip(wl["address"], wl[label_col].astype(str)))
 
     addresses = set(wl["address"])
     _log(f"[*] Loaded {len(addresses)} institutional addresses from '{filepath}'.")

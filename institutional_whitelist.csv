@@ -1,17 +1,9 @@
-address,institution,category
-1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa,Satoshi Nakamoto (Genesis),Historical
-3FkenCiXpSLqD8L79intRNXUgjRoH9sjXa,Binance,Exchange
-1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s,Binance Cold Wallet,Exchange
-bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h,Binance Hot Wallet,Exchange
-3M219KR5vEneNb47ewrPfWyb5jQ2DjxRP6,Coinbase,Exchange
-bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh,Uniswap Router,DeFi
-3E1qL1aV2cTKimJ4BfGq2bVQRrn6kRLtop,Kraken,Exchange
-3Cbq7aT1tY8kMxWLbitaG7yT6bPbKChq64,Huobi,Exchange
-bc1q0sg9rdst255gtldsmcf8rk0764avqy2h2ksqs5,Gemini,Exchange
-3JZq4atUahhuA9rLhXLMhhTo133J9rF97j,Bitfinex,Exchange
-1CK6KHY6MHgYvmRQ4PAafKYDrg1ejbH1cE,F2Pool,Mining Pool
-12dRugNcdxK39288NjcDV4GX7rMsKCGn6B,AntPool,Mining Pool
-1KFHE7w8BhaENAswwryaoccDb6qcT6DbYY,ViaBTC,Mining Pool
-bc1qjl8uwezzlech723lpnyuza0h2cdkvxvh54v3dn,Foundry USA,Mining Pool
-3HRFrJMt9phZyMRAxDehp46P6p2p1buZ8N,BitGo Custody,Custodial
-bc1qa5wkgaew2dkv56kc6hna8dnkwlnmt2xnfwfxv5,Tether Treasury,Stablecoin
+address,entity_name,risk_override
+1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s,Binance_HotWallet,0.0
+1BinanceHotXyz,Binance_HotWallet,0.0
+3Kzh9qAqVWQhEsfQz7zEQL1EuSx5tyNLsy,Coinbase_ColdStorage,0.0
+3CoinbaseCold123,Coinbase_ColdStorage,0.0
+1F2PoolMiningXyz,F2Pool_Mining,0.0
+bc1qF2PoolReward,F2Pool_Mining,0.0
+bc1qKrakenSweepXyz,Kraken_Sweep,0.0
+3KrakenDeposit,Kraken_Sweep,0.0
